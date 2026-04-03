@@ -7,6 +7,14 @@
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+  async function sha256Hex(str) {
+    const encoded = new TextEncoder().encode(str);
+    const buffer = await crypto.subtle.digest("SHA-256", encoded);
+    return Array.from(new Uint8Array(buffer))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+  }
+
   async function waitFor(predicate, { timeout = 10000, interval = 200 } = {}) {
     const start = Date.now();
     while (Date.now() - start < timeout) {
@@ -479,7 +487,7 @@
   // Phase 3: Assemble Markdown
   // ---------------------------------------------------------------------------
 
-  function toMarkdown({ pr, prTitle, sections }) {
+  async function toMarkdown({ pr, prTitle, sections }) {
     const out = [];
 
     // Header
@@ -509,10 +517,13 @@
       }
 
       for (const diff of section.diffs) {
+        const shortName = diff.filePath.split("/").pop();
+        const fileHash = await sha256Hex(diff.filePath);
+        const ghDiffLink = `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.number}/files#diff-${fileHash}`;
+
         if (diff.lines.length === 0) {
-          const shortName = diff.filePath.split("/").pop();
           out.push(
-            `> **\`${shortName}\`** — *diff not available (file too large or failed to load)*`
+            `> [**\`${shortName}\`**](${ghDiffLink}) — *diff not available (file too large or failed to load)*`
           );
           out.push("");
           continue;
@@ -520,23 +531,35 @@
 
         const hunks = splitIntoHunks(diff.lines);
 
-        const shortName = diff.filePath.split("/").pop();
         const annotation = diff.lineRange
           ? ` (${diff.lineRange})`
           : diff.isNew
             ? " — new file"
             : "";
 
+        // New files with only additions: render as the actual language
+        // without +/- prefixes for proper syntax highlighting.
+        const allAdded = diff.lines.every((l) => l.prefix === "+");
+
         out.push(`<details>`);
-        out.push(`<summary><code>${shortName}</code>${annotation}</summary>`);
+        out.push(`<summary><a href="${ghDiffLink}" target="_blank"><code>${shortName}</code></a>${annotation}</summary>`);
         out.push("");
-        for (let hi = 0; hi < hunks.length; hi++) {
-          if (hi > 0) out.push(""); // blank line between hunks
-          out.push("```diff");
-          for (const line of hunks[hi]) {
-            out.push(`${line.prefix}${line.text}`);
+        if (allAdded) {
+          const lang = fenceLang(diff.language);
+          out.push("```" + lang);
+          for (const line of diff.lines) {
+            out.push(line.text);
           }
           out.push("```");
+        } else {
+          for (let hi = 0; hi < hunks.length; hi++) {
+            if (hi > 0) out.push(""); // blank line between hunks
+            out.push("```diff");
+            for (const line of hunks[hi]) {
+              out.push(`${line.prefix}${line.text}`);
+            }
+            out.push("```");
+          }
         }
         out.push("");
         out.push("</details>");
@@ -547,6 +570,32 @@
     return out.join("\n");
   }
 
+
+  function fenceLang(graphiteLang) {
+    const map = {
+      Scala: "scala",
+      SQL: "sql",
+      Java: "java",
+      Kotlin: "kotlin",
+      JavaScript: "js",
+      TypeScript: "ts",
+      Python: "python",
+      Go: "go",
+      Rust: "rust",
+      Ruby: "ruby",
+      "Protocol Buffers": "protobuf",
+      Shell: "bash",
+      YAML: "yaml",
+      JSON: "json",
+      TOML: "toml",
+      XML: "xml",
+      HTML: "html",
+      CSS: "css",
+      Markdown: "md",
+      txt: "text",
+    };
+    return map[graphiteLang] || graphiteLang?.toLowerCase() || "";
+  }
 
   function splitIntoHunks(lines) {
     // Split a sorted line array into separate hunks wherever there's a gap
@@ -606,7 +655,7 @@
       }
 
       onProgress("Assembling markdown...");
-      const markdown = toMarkdown(tour);
+      const markdown = await toMarkdown(tour);
 
       onProgress("Sending to popup...");
       sendResponse({

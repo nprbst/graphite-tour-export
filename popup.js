@@ -16,6 +16,34 @@ function setEnabled(enabled) {
   githubBtn.disabled = !enabled;
 }
 
+// Send an action to the content script via a port so we can receive
+// progress updates without the popup's event loop blocking on await.
+function sendAction(tabId, action) {
+  return new Promise((resolve, reject) => {
+    const port = chrome.tabs.connect(tabId, { name: "tour-export" });
+
+    port.onMessage.addListener((msg) => {
+      if (msg.type === "progress") {
+        setStatus(msg.status);
+      } else if (msg.type === "result") {
+        resolve(msg.data);
+        port.disconnect();
+      } else if (msg.type === "error") {
+        reject(new Error(msg.message));
+        port.disconnect();
+      }
+    });
+
+    port.onDisconnect.addListener(() => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+      }
+    });
+
+    port.postMessage({ action });
+  });
+}
+
 // Check if current tab is a Graphite tour page
 async function init() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -27,7 +55,6 @@ async function init() {
     return;
   }
 
-  // Ping the content script to verify it's loaded and the tour is present
   try {
     const response = await chrome.tabs.sendMessage(tab.id, { action: "ping" });
     if (!response?.isTourPage) {
@@ -36,7 +63,6 @@ async function init() {
       return;
     }
   } catch {
-    // Content script not loaded yet — might need a page refresh
     setStatus("Reload the page and try again.", "error");
     setEnabled(false);
     return;
@@ -44,13 +70,6 @@ async function init() {
 
   setStatus("Ready");
 }
-
-// Listen for progress updates from content script
-chrome.runtime.onMessage.addListener((message) => {
-  if (message.type === "progress") {
-    setStatus(message.status);
-  }
-});
 
 // Copy as Markdown
 copyBtn.addEventListener("click", async () => {
@@ -60,7 +79,7 @@ copyBtn.addEventListener("click", async () => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
 
   try {
-    const result = await chrome.tabs.sendMessage(tab.id, { action: "extract" });
+    const result = await sendAction(tab.id, "extract");
 
     if (result.error) {
       setStatus(result.error, "error");
@@ -87,7 +106,7 @@ githubBtn.addEventListener("click", async () => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
 
   try {
-    const result = await chrome.tabs.sendMessage(tab.id, { action: "extract" });
+    const result = await sendAction(tab.id, "extract-and-post");
 
     if (result.error) {
       setStatus(result.error, "error");
@@ -95,21 +114,8 @@ githubBtn.addEventListener("click", async () => {
       return;
     }
 
-    setStatus("Filling discussion comment...");
-
-    const fillResult = await chrome.tabs.sendMessage(tab.id, {
-      action: "fill-comment",
-      markdown: result.markdown,
-    });
-
-    if (fillResult.error) {
-      setStatus(fillResult.error, "error");
-      setEnabled(true);
-      return;
-    }
-
     const kb = Math.round(result.charCount / 1024);
-    if (fillResult.posted) {
+    if (result.posted) {
       setStatus(`Posted! (${kb} KB)`, "success");
     } else {
       setStatus(`Comment filled (${kb} KB) — click Post to submit.`, "success");

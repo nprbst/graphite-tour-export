@@ -67,6 +67,7 @@
     const MAX_STEPS = 500;
     const TARGET_OFFSET = 30;
 
+    let prevScrollTop = -1;
     for (let i = 0; i < MAX_STEPS; i++) {
       const containerRect = scrollContainer.getBoundingClientRect();
       const cardRect = card.getBoundingClientRect();
@@ -78,11 +79,15 @@
         break;
       }
 
+      // If scroll didn't move, we've hit the limit — stop
+      if (scrollContainer.scrollTop === prevScrollTop) break;
+      prevScrollTop = scrollContainer.scrollTop;
+
       scrollContainer.scrollTop += (distance > 0 ? 1 : -1) * STEP;
       await sleep(DELAY);
     }
 
-    await sleep(200);
+    await sleep(100);
   }
 
   function harvestLines(card) {
@@ -206,44 +211,50 @@
         }
       } else if (isFileCard && currentSection) {
         cardNumber++;
-        onProgress?.(`Rendering diffs... (${cardNumber}/${totalCards})`);
+        const shortFile = child.querySelector('[class*="FileDiffTitle_fileDiffTitle__"]')
+          ?.textContent?.trim()?.split("/")?.pop() || "";
+        onProgress?.(`Rendering ${shortFile} (${cardNumber}/${totalCards})`);
 
         const diff = scrollContainer
-          ? await scrollAndHarvestCard(scrollContainer, child)
+          ? await scrollAndHarvestCard(scrollContainer, child, onProgress)
           : extractDiffCard(child);
 
         if (diff) {
           currentSection.diffs.push(diff);
         }
+
+        onProgress?.(`Rendered ${cardNumber}/${totalCards} diffs`);
+
       }
     }
 
     return { pr, prTitle, sections };
   }
 
-  async function scrollAndHarvestCard(scrollContainer, card) {
+  async function scrollAndHarvestCard(scrollContainer, card, onProgress) {
     // Scroll the card into view
     await smoothScrollToCard(scrollContainer, card);
 
     // Wait for content to render
     const hasLoading = card.querySelector('img[alt="Loading..."]') !== null;
     if (hasLoading) {
+      onProgress?.("Waiting for card to load...");
       const loaded = await waitFor(
         () => card.querySelector('img[alt="Loading..."]') === null,
         { timeout: 3000, interval: 200 }
       );
-      if (!loaded) return extractDiffCard(card); // give up, take what's there
+      if (!loaded) return extractDiffCard(card);
     }
 
     const diffLines = card.querySelector(
       '[class*="FileDiffLines_fileDiffLines__"]'
     );
-    if (diffLines) {
+    if (diffLines && diffLines.children.length <= 1) {
+      onProgress?.("Waiting for lines to render...");
       await waitFor(() => diffLines.children.length > 1, {
         timeout: 3000,
         interval: 100,
       });
-      await sleep(200);
     }
 
 
@@ -271,28 +282,28 @@
     const lineMap = new Map();
     for (const l of harvestLines(card)) lineMap.set(l.key, l);
 
+    // Only scroll through cards taller than the viewport
     if (diffLines) {
+      const cardRect = card.getBoundingClientRect();
       const viewH = scrollContainer.clientHeight;
-      const stepPx = Math.floor(viewH * 0.4);
-      let prevCount = lineMap.size;
-      let staleStops = 0;
 
-      for (let s = 0; s < 200; s++) {
-        const cRect = card.getBoundingClientRect();
-        const sRect = scrollContainer.getBoundingClientRect();
-        const cardBottom = cRect.bottom - sRect.top;
+      if (cardRect.height > viewH * 0.8) {
+        const stepPx = Math.floor(viewH * 0.4);
+        let prevCount = lineMap.size;
 
-        if (cardBottom < viewH * 0.3) break;
+        for (let s = 0; s < 200; s++) {
+          const cRect = card.getBoundingClientRect();
+          const sRect = scrollContainer.getBoundingClientRect();
+          const cardBottom = cRect.bottom - sRect.top;
 
-        scrollContainer.scrollTop += stepPx;
-        await sleep(250);
-        for (const l of harvestLines(card)) lineMap.set(l.key, l);
+          if (cardBottom < viewH * 0.3) break;
 
-        if (lineMap.size === prevCount) {
-          staleStops++;
-          if (staleStops >= 2) break;
-        } else {
-          staleStops = 0;
+          scrollContainer.scrollTop += stepPx;
+          await sleep(200);
+          for (const l of harvestLines(card)) lineMap.set(l.key, l);
+
+          // Stop as soon as we get no new lines
+          if (lineMap.size === prevCount) break;
           prevCount = lineMap.size;
         }
       }
@@ -626,11 +637,29 @@
   // Message handler — popup sends messages, we respond
   // ---------------------------------------------------------------------------
 
+  // Port-based messaging for long-running actions with progress updates.
+  // The popup opens a port, sends an action, and receives progress + result.
+  chrome.runtime.onConnect.addListener((port) => {
+    if (port.name !== "tour-export") return;
+
+    port.onMessage.addListener((message) => {
+      const onProgress = (status) => {
+        port.postMessage({ type: "progress", status });
+      };
+      const sendResult = (data) => {
+        port.postMessage({ type: "result", data });
+      };
+
+      if (message.action === "extract") {
+        handleExtract(onProgress, sendResult);
+      } else if (message.action === "extract-and-post") {
+        handleExtractAndPost(onProgress, sendResult);
+      }
+    });
+  });
+
+  // One-shot messages for quick actions (ping, fill-comment)
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    if (message.action === "extract") {
-      handleExtract(message, sendResponse);
-      return true; // async response
-    }
     if (message.action === "fill-comment") {
       handleFillComment(message, sendResponse);
       return true;
@@ -698,34 +727,97 @@
     }
   }
 
+  async function handleExtractAndPost(onProgress, sendResult) {
+    try {
+      const tour = await extractTourWithScroll(onProgress);
+      if (!tour) {
+        sendResult({ error: "Could not find tour content on this page." });
+        return;
+      }
+
+      onProgress("Building markdown...");
+      const markdown = await toMarkdown(tour);
+
+      onProgress(`Posting comment (${Math.round(markdown.length / 1024)} KB)...`);
+      const textarea = document.querySelector(
+        'textarea[placeholder="Add discussion comment"]'
+      );
+      if (!textarea) {
+        sendResult({
+          error: "Could not find the discussion comment box.",
+        });
+        return;
+      }
+
+      textarea.scrollIntoView({ block: "center" });
+      textarea.dispatchEvent(
+        new MouseEvent("mousedown", { bubbles: true })
+      );
+      textarea.dispatchEvent(
+        new MouseEvent("mouseup", { bubbles: true })
+      );
+      textarea.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      textarea.focus();
+      textarea.dispatchEvent(
+        new FocusEvent("focus", { bubbles: true })
+      );
+      textarea.dispatchEvent(
+        new FocusEvent("focusin", { bubbles: true })
+      );
+
+      const nativeSetter = Object.getOwnPropertyDescriptor(
+        HTMLTextAreaElement.prototype,
+        "value"
+      ).set;
+      nativeSetter.call(textarea, markdown);
+      textarea.dispatchEvent(new Event("input", { bubbles: true }));
+      textarea.dispatchEvent(new Event("change", { bubbles: true }));
+
+      const posted = await waitFor(() => {
+        const btn = [...document.querySelectorAll("button")].find(
+          (b) => b.textContent?.trim() === "Post" && !b.disabled
+        );
+        if (btn) {
+          btn.click();
+          return true;
+        }
+        return false;
+      }, { timeout: 2000, interval: 100 });
+
+      sendResult({
+        ok: true,
+        posted,
+        charCount: markdown.length,
+      });
+    } catch (err) {
+      sendResult({ error: err.message });
+    }
+  }
+
   function isTourPage() {
     return /app\.graphite\.com\/github\/pr\/.+/.test(window.location.href)
       && document.querySelector('[class*="CodeDiff_diffStepsColumn__"]') !== null;
   }
 
-  async function handleExtract(message, sendResponse) {
+  async function handleExtract(onProgress, sendResult) {
     try {
-      const onProgress = (status) => {
-        chrome.runtime.sendMessage({ type: "progress", status });
-      };
-
       const tour = await extractTourWithScroll(onProgress);
       if (!tour) {
-        sendResponse({ error: "Could not find tour content on this page." });
+        sendResult({ error: "Could not find tour content on this page." });
         return;
       }
 
-      onProgress("Assembling markdown...");
+      onProgress("Building markdown...");
       const markdown = await toMarkdown(tour);
 
-      onProgress("Sending to popup...");
-      sendResponse({
+      onProgress(`Sending (${Math.round(markdown.length / 1024)} KB)...`);
+      sendResult({
         markdown,
         pr: tour.pr,
         charCount: markdown.length,
       });
     } catch (err) {
-      sendResponse({ error: err.message });
+      sendResult({ error: err.message });
     }
   }
 })();

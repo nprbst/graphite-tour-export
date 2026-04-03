@@ -631,11 +631,72 @@
       handleExtract(message, sendResponse);
       return true; // async response
     }
+    if (message.action === "fill-comment") {
+      handleFillComment(message, sendResponse);
+      return true;
+    }
     if (message.action === "ping") {
       sendResponse({ ok: true, isTourPage: isTourPage() });
       return false;
     }
   });
+
+  async function handleFillComment(message, sendResponse) {
+    try {
+      const textarea = document.querySelector(
+        'textarea[placeholder="Add discussion comment"]'
+      );
+      if (!textarea) {
+        sendResponse({ error: "Could not find the discussion comment box." });
+        return;
+      }
+
+      textarea.scrollIntoView({ behavior: "smooth", block: "center" });
+      await sleep(300);
+
+      // Simulate a real click → focus sequence so Graphite's React
+      // handlers fire and reveal the Post button
+      textarea.dispatchEvent(
+        new MouseEvent("mousedown", { bubbles: true })
+      );
+      textarea.dispatchEvent(
+        new MouseEvent("mouseup", { bubbles: true })
+      );
+      textarea.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      textarea.focus();
+      textarea.dispatchEvent(
+        new FocusEvent("focus", { bubbles: true })
+      );
+      textarea.dispatchEvent(
+        new FocusEvent("focusin", { bubbles: true })
+      );
+      await sleep(300);
+
+      const nativeSetter = Object.getOwnPropertyDescriptor(
+        HTMLTextAreaElement.prototype,
+        "value"
+      ).set;
+      nativeSetter.call(textarea, message.markdown);
+      textarea.dispatchEvent(new Event("input", { bubbles: true }));
+      textarea.dispatchEvent(new Event("change", { bubbles: true }));
+
+      // Wait for the Post button to become enabled, then click it
+      const posted = await waitFor(() => {
+        const btn = [...document.querySelectorAll("button")].find(
+          (b) => b.textContent?.trim() === "Post" && !b.disabled
+        );
+        if (btn) {
+          btn.click();
+          return true;
+        }
+        return false;
+      }, { timeout: 3000, interval: 200 });
+
+      sendResponse({ ok: true, posted });
+    } catch (err) {
+      sendResponse({ error: err.message });
+    }
+  }
 
   function isTourPage() {
     return /app\.graphite\.com\/github\/pr\/.+/.test(window.location.href)

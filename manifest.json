@@ -2,8 +2,8 @@
   "manifest_version": 3,
   "name": "Graphite Tour Export",
   "version": "1.0.0",
-  "description": "Export Graphite PR Tours as Markdown — copy to clipboard or post as a GitHub PR comment",
-  "permissions": ["activeTab", "storage"],
+  "description": "Export Graphite PR Tours as Markdown — copy to clipboard or post as a discussion comment",
+  "permissions": ["activeTab"],
   "icons": {
     "16": "icons/icon-16.png",
     "48": "icons/icon-48.png",
@@ -17,11 +17,6 @@
     {
       "matches": ["https://app.graphite.com/*"],
       "js": ["content-graphite.js"],
-      "run_at": "document_idle"
-    },
-    {
-      "matches": ["https://github.com/*"],
-      "js": ["content-github.js"],
       "run_at": "document_idle"
     }
   ]

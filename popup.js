@@ -79,7 +79,7 @@ copyBtn.addEventListener("click", async () => {
   setEnabled(true);
 });
 
-// Comment on GitHub PR
+// Post as discussion comment
 githubBtn.addEventListener("click", async () => {
   setEnabled(false);
   setStatus("Extracting tour...");
@@ -95,30 +95,25 @@ githubBtn.addEventListener("click", async () => {
       return;
     }
 
-    setStatus("Preparing GitHub comment...");
+    setStatus("Filling discussion comment...");
 
-    // Check GitHub comment size limit (65536 chars)
-    if (result.markdown.length > 65536) {
-      setStatus(
-        `Too large for GitHub comment (${Math.round(result.markdown.length / 1024)} KB > 64 KB). Use clipboard instead.`,
-        "error"
-      );
+    const fillResult = await chrome.tabs.sendMessage(tab.id, {
+      action: "fill-comment",
+      markdown: result.markdown,
+    });
+
+    if (fillResult.error) {
+      setStatus(fillResult.error, "error");
       setEnabled(true);
       return;
     }
 
-    // Store markdown for the GitHub content script to pick up
-    const { owner, repo, number } = result.pr;
-    await chrome.storage.local.set({
-      pendingComment: result.markdown,
-      pendingPr: { owner, repo, number },
-    });
-
-    setStatus("Opening GitHub PR...");
-    const ghUrl = `https://github.com/${owner}/${repo}/pull/${number}`;
-    await chrome.tabs.create({ url: ghUrl });
-
-    setStatus("Opened GitHub PR — comment will be pre-filled.", "success");
+    const kb = Math.round(result.charCount / 1024);
+    if (fillResult.posted) {
+      setStatus(`Posted! (${kb} KB)`, "success");
+    } else {
+      setStatus(`Comment filled (${kb} KB) — click Post to submit.`, "success");
+    }
   } catch (err) {
     setStatus("Failed: " + err.message, "error");
   }

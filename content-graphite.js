@@ -51,22 +51,30 @@
   // Phase 1: Prepare the page — expand collapsed sections, trigger lazy loads
   // ---------------------------------------------------------------------------
 
-  // Pre-extracted diff data, keyed by the card's index within the tour column.
-  // Using index (not element ref) because Graphite may re-render DOM elements
-  // during scrolling, invalidating WeakMap references.
-  const cardDiffCache = new Map();
-
-  async function smoothScrollBy(container, pixels) {
+  async function smoothScrollToCard(scrollContainer, card) {
+    // Scroll in small steps, re-checking the card's position each step.
+    // Immune to DOM layout shifts from Graphite's virtual renderer.
     const STEP = 80;
     const DELAY = 40;
-    const direction = pixels > 0 ? 1 : -1;
-    let remaining = Math.abs(pixels);
-    while (remaining > 0) {
-      const chunk = Math.min(remaining, STEP);
-      container.scrollTop += direction * chunk;
-      remaining -= chunk;
+    const MAX_STEPS = 500;
+    const TARGET_OFFSET = 30;
+
+    for (let i = 0; i < MAX_STEPS; i++) {
+      const containerRect = scrollContainer.getBoundingClientRect();
+      const cardRect = card.getBoundingClientRect();
+      const distance = (cardRect.top - containerRect.top) - TARGET_OFFSET;
+
+      if (Math.abs(distance) < STEP) {
+        scrollContainer.scrollTop += distance;
+        await sleep(DELAY);
+        break;
+      }
+
+      scrollContainer.scrollTop += (distance > 0 ? 1 : -1) * STEP;
       await sleep(DELAY);
     }
+
+    await sleep(200);
   }
 
   function harvestLines(card) {
@@ -89,15 +97,22 @@
       );
       if (!codeDiv) continue; // placeholder — not rendered yet
 
-      const isAdded = contentDiv.className.includes("added");
-      const isDeleted = contentDiv.className.includes("deleted");
-      const prefix = isAdded ? "+" : isDeleted ? "-" : " ";
-
       const gutter = lineEl.querySelector("[data-gutter-line-number]");
       const lineNum = gutter
         ? parseInt(gutter.getAttribute("data-gutter-line-number"), 10)
         : null;
       const side = gutter?.getAttribute("data-side") || null;
+
+      // The gutter's inner div has reliable added/deleted classes,
+      // unlike the content div which omits them on some lines.
+      const gutterInner = gutter?.querySelector(
+        '[class*="line_side_number__"]'
+      );
+      const gutterClass = gutterInner?.className || "";
+      const isAdded = gutterClass.includes("added");
+      const isDeleted = gutterClass.includes("deleted");
+
+      const prefix = isAdded ? "+" : isDeleted ? "-" : " ";
 
       result.push({
         key: `${side}:${lineNum}`,
@@ -110,170 +125,51 @@
     return result;
   }
 
-  async function preparePage(onProgress) {
-    // Strategy: smooth-scroll through each file card from top to bottom,
-    // harvesting rendered diff lines at each viewport position. Lines are
-    // deduped by key (side + lineNum) so we accumulate the complete set
-    // even though only a viewport's worth are rendered at any moment.
-
-    const scrollContainer = findScrollableAncestor(
-      document.querySelector('[class*="CodeDiff_diffStepsColumn__"]')
-    );
-    if (!scrollContainer) return;
-
-    const tourColumn = document.querySelector(
-      '[class*="CodeDiff_diffStepsColumn__"]'
-    );
-    if (!tourColumn) return;
-
-    scrollContainer.scrollTop = 0;
-    await sleep(300);
-
-    const allChildren = [...tourColumn.children];
-    const fileCardEntries = allChildren
-      .map((el, idx) => [idx, el])
-      .filter(([, el]) => el.matches?.('[class*="FileCard_file__"]'));
-    const total = fileCardEntries.length;
-
-    for (let i = 0; i < total; i++) {
-      onProgress?.(`Rendering diffs... (${i + 1}/${total})`);
-      const [childIndex, card] = fileCardEntries[i];
-
-      // ── Scroll so the top of this card is near the top of the viewport ──
-      const containerRect = scrollContainer.getBoundingClientRect();
-      const cardRect = card.getBoundingClientRect();
-      const desiredScrollTop =
-        scrollContainer.scrollTop +
-        (cardRect.top - containerRect.top) -
-        30;
-      await smoothScrollBy(
-        scrollContainer,
-        desiredScrollTop - scrollContainer.scrollTop
-      );
-      await sleep(400);
-
-      // ── Wait for initial render ──
-      const hasLoading = card.querySelector('img[alt="Loading..."]') !== null;
-      if (hasLoading) {
-        const loaded = await waitFor(
-          () => card.querySelector('img[alt="Loading..."]') === null,
-          { timeout: 3000, interval: 200 }
-        );
-        if (!loaded) {
-          // Card never loaded — cache empty result and move on
-          cardDiffCache.set(childIndex, extractDiffCardHeader(card));
-          continue;
-        }
-      }
-
-      const diffLines = card.querySelector(
-        '[class*="FileDiffLines_fileDiffLines__"]'
-      );
-      if (diffLines) {
-        await waitFor(() => diffLines.children.length > 1, {
-          timeout: 3000,
-          interval: 100,
-        });
-        await sleep(200);
-      }
-
-      // ── Expand any "N lines" context-collapse buttons ──
-      const expandBtns = [...card.querySelectorAll("button")].filter((b) =>
-        /^\d+ lines?$/.test(b.textContent?.trim())
-      );
-      for (const btn of expandBtns) {
-        btn.click();
-        await sleep(200);
-      }
-      if (expandBtns.length > 0) await sleep(500);
-
-      // ── Progressive harvest: scroll through the card, collecting lines ──
-      const lineMap = new Map();
-
-      // Harvest the initial viewport
-      for (const l of harvestLines(card)) lineMap.set(l.key, l);
-
-      // Scroll through tall cards in half-viewport steps
-      if (diffLines) {
-        const updatedRect = card.getBoundingClientRect();
-        const viewH = scrollContainer.clientHeight;
-
-        if (updatedRect.height > viewH * 0.5) {
-          const stepPx = Math.floor(viewH * 0.4);
-          const steps = Math.ceil(updatedRect.height / stepPx);
-          for (let s = 0; s < steps; s++) {
-            await smoothScrollBy(scrollContainer, stepPx);
-            await sleep(300);
-            for (const l of harvestLines(card)) lineMap.set(l.key, l);
-          }
-        }
-      }
-
-      // Sort lines by line number
-      const sorted = [...lineMap.values()].sort((a, b) => {
-        if (a.lineNum == null || b.lineNum == null) return 0;
-        return a.lineNum - b.lineNum;
-      });
-
-      // Build the cached result with header info + harvested lines
-      const header = extractDiffCardHeader(card);
-      header.lines = sorted;
-      cardDiffCache.set(childIndex, header);
-    }
-  }
-
-  function extractDiffCardHeader(card) {
-    const titleBtn = card.querySelector(
-      '[class*="FileDiffTitle_fileDiffTitle__"]'
-    );
-    const langBtn = card.querySelector(
-      '[class*="LanguageSelector_languageSelectorButton__"]'
-    );
-    const headerEl = card.querySelector('[class*="FileHeader_fileHeader__"]');
-    const headerText = headerEl?.textContent || "";
-    const lineRangeMatch = headerText.match(/Lines?\s+(\d+[–\-]\d+|\d+)/);
-    return {
-      filePath: titleBtn?.textContent?.trim() || "unknown",
-      language: langBtn?.textContent?.trim() || "",
-      isNew: headerText.includes("Created"),
-      lineRange: lineRangeMatch ? lineRangeMatch[0] : null,
-      lines: [],
-    };
-  }
-
   // ---------------------------------------------------------------------------
-  // Phase 2: Extract the tour structure from the DOM
+  // Single-pass extraction: walk the tour column, extracting narrative from
+  // context blocks (no scroll needed) and scrolling+harvesting each file card
+  // in place. This avoids all index/cache coherency problems because we never
+  // revisit a card after scrolling past it.
   // ---------------------------------------------------------------------------
 
-  function extractTour() {
+  async function extractTourWithScroll(onProgress) {
     const pr = parsePrFromUrl();
     const prTitle = getPrTitle();
 
-    // The tour is a flat list of alternating context blocks and file cards
     const tourColumn = document.querySelector(
       '[class*="CodeDiff_diffStepsColumn__"]'
     );
     if (!tourColumn) return null;
 
+    const scrollContainer = findScrollableAncestor(tourColumn);
+    if (scrollContainer) {
+      scrollContainer.scrollTop = 0;
+      await sleep(300);
+    }
+
     const children = [...tourColumn.children];
     const sections = [];
     let currentSection = null;
+    let cardNumber = 0;
+    const totalCards = children.filter((c) =>
+      c.matches?.('[class*="FileCard_file__"]')
+    ).length;
 
-    for (let ci = 0; ci < children.length; ci++) {
-      const child = children[ci];
-      const isContext = child.matches?.('[class*="CodeTourContextBlock_context__"]');
+    for (const child of children) {
+      const isContext = child.matches?.(
+        '[class*="CodeTourContextBlock_context__"]'
+      );
       const isFileCard = child.matches?.('[class*="FileCard_file__"]');
 
       if (isContext) {
-        const markdownDiv = child.querySelector('[class*="markdown_markdown__"]');
+        const markdownDiv = child.querySelector(
+          '[class*="markdown_markdown__"]'
+        );
         if (!markdownDiv) continue;
 
-        // A single context block can contain multiple headings (h2 + nested h3s).
-        // Split it into sub-sections by walking children and splitting on headings.
         const headings = [...markdownDiv.querySelectorAll("h2, h3")];
 
         if (headings.length > 0) {
-          // Process each heading and the content between it and the next heading
           for (let hi = 0; hi < headings.length; hi++) {
             const heading = headings[hi];
             const anchor = heading.querySelector("a[href^='#']");
@@ -287,7 +183,6 @@
             };
             sections.push(currentSection);
 
-            // Collect elements between this heading and the next
             const nextHeading = headings[hi + 1] || null;
             currentSection.narrative = extractNarrativeBetween(
               markdownDiv,
@@ -296,15 +191,19 @@
             );
           }
         } else if (currentSection) {
-          // Continuation of narrative in the same section (no heading)
           const text = extractNarrative(markdownDiv, null);
           if (text) {
             currentSection.narrative += "\n\n" + text;
           }
         }
       } else if (isFileCard && currentSection) {
-        // Use cached extraction from preparePage (keyed by child index)
-        const diff = cardDiffCache.get(ci) || extractDiffCard(child);
+        cardNumber++;
+        onProgress?.(`Rendering diffs... (${cardNumber}/${totalCards})`);
+
+        const diff = scrollContainer
+          ? await scrollAndHarvestCard(scrollContainer, child)
+          : extractDiffCard(child);
+
         if (diff) {
           currentSection.diffs.push(diff);
         }
@@ -312,6 +211,91 @@
     }
 
     return { pr, prTitle, sections };
+  }
+
+  async function scrollAndHarvestCard(scrollContainer, card) {
+    // Scroll the card into view
+    await smoothScrollToCard(scrollContainer, card);
+
+    // Wait for content to render
+    const hasLoading = card.querySelector('img[alt="Loading..."]') !== null;
+    if (hasLoading) {
+      const loaded = await waitFor(
+        () => card.querySelector('img[alt="Loading..."]') === null,
+        { timeout: 3000, interval: 200 }
+      );
+      if (!loaded) return extractDiffCard(card); // give up, take what's there
+    }
+
+    const diffLines = card.querySelector(
+      '[class*="FileDiffLines_fileDiffLines__"]'
+    );
+    if (diffLines) {
+      await waitFor(() => diffLines.children.length > 1, {
+        timeout: 3000,
+        interval: 100,
+      });
+      await sleep(200);
+    }
+
+
+
+    // Extract header info
+    const titleBtn = card.querySelector(
+      '[class*="FileDiffTitle_fileDiffTitle__"]'
+    );
+    const langBtn = card.querySelector(
+      '[class*="LanguageSelector_languageSelectorButton__"]'
+    );
+    const headerEl = card.querySelector('[class*="FileHeader_fileHeader__"]');
+    const headerText = headerEl?.textContent || "";
+    const lineRangeMatch = headerText.match(/Lines?\s+(\d+[–\-]\d+|\d+)/);
+
+    const result = {
+      filePath: titleBtn?.textContent?.trim() || "unknown",
+      language: langBtn?.textContent?.trim() || "",
+      isNew: headerText.includes("Created"),
+      lineRange: lineRangeMatch ? lineRangeMatch[0] : null,
+      lines: [],
+    };
+
+    // Progressive harvest — collect lines as we scroll through the card
+    const lineMap = new Map();
+    for (const l of harvestLines(card)) lineMap.set(l.key, l);
+
+    if (diffLines) {
+      const viewH = scrollContainer.clientHeight;
+      const stepPx = Math.floor(viewH * 0.4);
+      let prevCount = lineMap.size;
+      let staleStops = 0;
+
+      for (let s = 0; s < 200; s++) {
+        const cRect = card.getBoundingClientRect();
+        const sRect = scrollContainer.getBoundingClientRect();
+        const cardBottom = cRect.bottom - sRect.top;
+
+        if (cardBottom < viewH * 0.3) break;
+
+        scrollContainer.scrollTop += stepPx;
+        await sleep(250);
+        for (const l of harvestLines(card)) lineMap.set(l.key, l);
+
+        if (lineMap.size === prevCount) {
+          staleStops++;
+          if (staleStops >= 2) break;
+        } else {
+          staleStops = 0;
+          prevCount = lineMap.size;
+        }
+      }
+    }
+
+    // Sort: LEFT lines before RIGHT lines at the same line number,
+    // then by line number. This puts deletions before their replacements.
+    // Lines are in correct unified diff order from DOM traversal.
+    // Map preserves insertion order, so no sorting needed.
+    result.lines = [...lineMap.values()];
+    return result;
   }
 
   // ---------------------------------------------------------------------------
@@ -499,8 +483,6 @@
     const out = [];
 
     // Header
-    out.push(`# ${prTitle} (#${pr.number})`);
-    out.push("");
     out.push(
       `> Exported from [Graphite Tour](https://app.graphite.com/github/pr/${pr.owner}/${pr.repo}/${pr.number}?mode=tour)`
     );
@@ -527,14 +509,17 @@
       }
 
       for (const diff of section.diffs) {
-        if (diff.lines.length === 0) continue;
+        if (diff.lines.length === 0) {
+          const shortName = diff.filePath.split("/").pop();
+          out.push(
+            `> **\`${shortName}\`** — *diff not available (file too large or failed to load)*`
+          );
+          out.push("");
+          continue;
+        }
 
-        // Build the unified diff header
-        const aPath = diff.isNew ? "/dev/null" : `a/${diff.filePath}`;
-        const bPath = `b/${diff.filePath}`;
-        const hunkHeader = buildHunkHeader(diff);
+        const hunks = splitIntoHunks(diff.lines);
 
-        // Short label for the <summary>
         const shortName = diff.filePath.split("/").pop();
         const annotation = diff.lineRange
           ? ` (${diff.lineRange})`
@@ -545,14 +530,14 @@
         out.push(`<details>`);
         out.push(`<summary><code>${shortName}</code>${annotation}</summary>`);
         out.push("");
-        out.push("```diff");
-        out.push(`--- ${aPath}`);
-        out.push(`+++ ${bPath}`);
-        out.push(hunkHeader);
-        for (const line of diff.lines) {
-          out.push(`${line.prefix}${line.text}`);
+        for (let hi = 0; hi < hunks.length; hi++) {
+          if (hi > 0) out.push(""); // blank line between hunks
+          out.push("```diff");
+          for (const line of hunks[hi]) {
+            out.push(`${line.prefix}${line.text}`);
+          }
+          out.push("```");
         }
-        out.push("```");
         out.push("");
         out.push("</details>");
         out.push("");
@@ -562,25 +547,30 @@
     return out.join("\n");
   }
 
-  function buildHunkHeader(diff) {
-    const added = diff.lines.filter((l) => l.prefix === "+").length;
-    const deleted = diff.lines.filter((l) => l.prefix === "-").length;
-    const context = diff.lines.filter((l) => l.prefix === " ").length;
 
-    if (diff.isNew) {
-      return `@@ -0,0 +1,${added} @@`;
+  function splitIntoHunks(lines) {
+    // Split a sorted line array into separate hunks wherever there's a gap
+    // in RIGHT-side line numbers (> 1 jump). LEFT-side lines (deletions)
+    // use old line numbers and don't affect gap detection.
+    if (lines.length === 0) return [];
+
+    const hunks = [[]];
+    let lastRightLineNum = null;
+
+    for (const line of lines) {
+      if (line.side === "RIGHT" && line.lineNum != null) {
+        if (
+          lastRightLineNum != null &&
+          line.lineNum - lastRightLineNum > 1
+        ) {
+          hunks.push([]);
+        }
+        lastRightLineNum = line.lineNum;
+      }
+      hunks[hunks.length - 1].push(line);
     }
 
-    // Derive line numbers from the first line with a number
-    const firstLine = diff.lines.find((l) => l.lineNum != null);
-    const startLine = firstLine?.lineNum || 1;
-
-    const oldCount = deleted + context;
-    const newCount = added + context;
-    const oldStart = oldCount > 0 ? startLine : 0;
-    const newStart = newCount > 0 ? startLine : 0;
-
-    return `@@ -${oldStart},${oldCount} +${newStart},${newCount} @@`;
+    return hunks;
   }
 
   // ---------------------------------------------------------------------------
@@ -605,18 +595,20 @@
 
   async function handleExtract(message, sendResponse) {
     try {
-      await preparePage((status) => {
+      const onProgress = (status) => {
         chrome.runtime.sendMessage({ type: "progress", status });
-      });
+      };
 
-      const tour = extractTour();
+      const tour = await extractTourWithScroll(onProgress);
       if (!tour) {
         sendResponse({ error: "Could not find tour content on this page." });
         return;
       }
 
+      onProgress("Assembling markdown...");
       const markdown = toMarkdown(tour);
 
+      onProgress("Sending to popup...");
       sendResponse({
         markdown,
         pr: tour.pr,

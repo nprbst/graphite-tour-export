@@ -68,6 +68,7 @@ copyBtn.addEventListener("click", async () => {
       return;
     }
 
+    setStatus("Copying to clipboard...");
     await navigator.clipboard.writeText(result.markdown);
     const kb = Math.round(result.charCount / 1024);
     setStatus(`Copied! (${kb} KB)`, "success");
@@ -94,6 +95,8 @@ githubBtn.addEventListener("click", async () => {
       return;
     }
 
+    setStatus("Preparing GitHub comment...");
+
     // Check GitHub comment size limit (65536 chars)
     if (result.markdown.length > 65536) {
       setStatus(
@@ -111,7 +114,7 @@ githubBtn.addEventListener("click", async () => {
       pendingPr: { owner, repo, number },
     });
 
-    // Open GitHub PR page
+    setStatus("Opening GitHub PR...");
     const ghUrl = `https://github.com/${owner}/${repo}/pull/${number}`;
     await chrome.tabs.create({ url: ghUrl });
 
